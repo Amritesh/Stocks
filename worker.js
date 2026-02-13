@@ -3,6 +3,7 @@
  */
 
 self.onmessage = function(e) {
+    console.log("Worker: Received message", e.data);
     const params = e.data;
     const { S0, r, q, sigma, horizon, nPaths, seed, costBps, basisDegree, objectiveMode, lambda } = params;
 
@@ -57,31 +58,44 @@ self.onmessage = function(e) {
     for (let t = horizon - 1; t >= 1; t--) {
         const X = [];
         const Y = [];
-        const indices = [];
+        const itmIndices = [];
+
+        // Scale factor to keep Math.pow(x, degree) stable
+        const scale = 1 / S0;
 
         for (let i = 0; i < nPaths; i++) {
-            X.push(paths[i][t]);
+            const spot = paths[i][t];
+            // Only use paths that are "In The Money" or relevant for the boundary
+            // For a sell boundary, we typically look at paths where selling might be optimal
+            // To simplify and ensure stability, we take all paths but keep an eye on ITM
+            X.push(spot * scale);
             Y.push(cashFlows[i] * df);
-            indices.push(i);
         }
 
         // Polynomial Regression
-        const coeffs = solveRegression(X, Y, basisDegree);
+        let coeffs;
+        try {
+            coeffs = solveRegression(X, Y, basisDegree);
+        } catch (err) {
+            console.error(`Regression failed at t=${t}:`, err);
+            coeffs = new Float64Array(basisDegree + 1).fill(0);
+        }
         
         let sumS = 0, countS = 0;
 
         for (let i = 0; i < nPaths; i++) {
             const spot = paths[i][t];
             const immediate = spot * (1 - cost);
-            const continuation = predict(spot, coeffs);
+            const continuation = predict(spot * scale, coeffs);
 
             // Objective check
             let shouldStop = false;
             if (objectiveMode === 'max_ev') {
+                // Basic LSMC: if immediate exercise > continuation value
                 shouldStop = immediate > continuation;
             } else {
                 // Mean-Var approx: penalize continuation variance
-                shouldStop = immediate > (continuation - lambda * (continuation * 0.02)); 
+                shouldStop = immediate > (continuation - lambda * (continuation * 0.02));
             }
 
             if (shouldStop) {
@@ -92,7 +106,11 @@ self.onmessage = function(e) {
                 cashFlows[i] *= df;
             }
         }
-        boundary[t] = countS > 0 ? sumS / countS : boundary[t+1] || S0;
+        boundary[t] = countS > 0 ? sumS / countS : (boundary[t+1] || S0);
+        
+        // Safety: If boundary becomes too extreme, cap it
+        if (boundary[t] > S0 * 2) boundary[t] = S0 * 2;
+        if (boundary[t] < S0 * 0.1) boundary[t] = S0 * 0.1;
     }
     
     // Estimate t=0 boundary (extrapolate or use t=1)
@@ -108,7 +126,16 @@ self.onmessage = function(e) {
         return b;
     });
 
-    const decision = S0 * (1-cost) >= predict(S0, solveRegression(paths.map(p=>p[1]), cashFlows.map(c=>c*df), basisDegree)) ? 'SELL' : 'HOLD';
+    let decision = 'HOLD';
+    try {
+        const t1Scale = 1 / S0;
+        const t1X = paths.map(p => p[1] * t1Scale);
+        const t1Y = cashFlows.map(c => c * df);
+        const t1Coeffs = solveRegression(t1X, t1Y, basisDegree);
+        decision = S0 * (1-cost) >= predict(S0 * t1Scale, t1Coeffs) ? 'SELL' : 'HOLD';
+    } catch (e) {
+        console.error("Decision calc failed", e);
+    }
 
     self.postMessage({
         boundary: Array.from(boundary),
@@ -148,6 +175,7 @@ function gaussianElimination(A, B) {
         [B[i], B[max]] = [B[max], B[i]];
 
         for (let j = i + 1; j < n; j++) {
+            if (Math.abs(A[i][i]) < 1e-18) continue; // Avoid division by zero
             const factor = A[j][i] / A[i][i];
             B[j] -= factor * B[i];
             for (let k = i; k < n; k++) A[j][k] -= factor * A[i][k];
@@ -157,7 +185,8 @@ function gaussianElimination(A, B) {
     for (let i = n - 1; i >= 0; i--) {
         let sum = 0;
         for (let j = i + 1; j < n; j++) sum += A[i][j] * x[j];
-        x[i] = (B[i] - sum) / A[i][i];
+        if (Math.abs(A[i][i]) < 1e-18) x[i] = 0; // Handle singular matrix
+        else x[i] = (B[i] - sum) / A[i][i];
     }
     return x;
 }
