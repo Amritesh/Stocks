@@ -99,7 +99,9 @@ export default function App() {
       setSigmaEst((sigma * 100).toFixed(1));
 
       if (workerRef.current) workerRef.current.terminate();
-      workerRef.current = new Worker('/worker.js');
+      const workerUrl = new URL(`${import.meta.env.BASE_URL}worker.js`, window.location.origin);
+      console.log("Initializing worker from", workerUrl.toString());
+      workerRef.current = new Worker(workerUrl, { type: 'classic' });
       workerRef.current.onmessage = (e) => {
         const { boundary, decision, bands, spot } = e.data;
         setResults({ boundary, decision, bands, spot });
@@ -121,6 +123,15 @@ export default function App() {
         setLoading(false);
       };
       
+      workerRef.current.onerror = (err) => {
+        console.error("Worker error:", err);
+        setLoading(false);
+      };
+      workerRef.current.onmessageerror = (err) => {
+        console.error("Worker message error:", err);
+        setLoading(false);
+      };
+      console.log("Posting message to worker...");
       workerRef.current.postMessage({
         S0: data.ohlcv[data.ohlcv.length - 1].close,
         r: riskFree / 100,
