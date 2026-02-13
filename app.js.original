@@ -1,0 +1,228 @@
+/**
+ * app.js - Production-grade Quant UI for Indian & Global Markets
+ */
+
+const CONFIG = {
+    STOOQ_URL: (t) => `https://stooq.com/q/d/l/?s=${t}&i=d`,
+    CHART_THEME: {
+        layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
+        grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
+        crosshair: { mode: 0 },
+        timeScale: { borderColor: '#30363d' },
+    }
+};
+
+const state = {
+    ohlcv: [],
+    charts: {},
+    worker: null,
+    currency: '₹'
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    initCharts();
+    bindEvents();
+    handleRun();
+});
+
+function initCharts() {
+    const mainEl = document.getElementById('main-chart');
+    state.charts.main = LightweightCharts.createChart(mainEl, { 
+        ...CONFIG.CHART_THEME, 
+        height: 400,
+        localization: {
+            priceFormatter: price => `${state.currency}${price.toFixed(2)}`,
+        }
+    });
+    state.series = {
+        candles: state.charts.main.addCandlestickSeries(),
+        ma50: state.charts.main.addLineSeries({ color: '#2188ff', lineWidth: 1, visible: false }),
+        ma200: state.charts.main.addLineSeries({ color: '#e3b341', lineWidth: 1, visible: false }),
+        volBand: state.charts.main.addLineSeries({ color: 'rgba(88,166,255,0.2)', lineWidth: 1, visible: false }),
+        boundaryToday: state.charts.main.addLineSeries({ color: '#da3633', lineWidth: 2, lineStyle: 2 })
+    };
+
+    state.charts.boundary = LightweightCharts.createChart(document.getElementById('boundary-chart'), { 
+        ...CONFIG.CHART_THEME, 
+        height: 250,
+        localization: { priceFormatter: p => `${state.currency}${p.toFixed(2)}` }
+    });
+    state.series.boundaryCurve = state.charts.boundary.addLineSeries({ color: '#da3633', lineWidth: 2 });
+
+    state.charts.fan = LightweightCharts.createChart(document.getElementById('fan-chart'), { 
+        ...CONFIG.CHART_THEME, 
+        height: 250,
+        localization: { priceFormatter: p => `${state.currency}${p.toFixed(2)}` }
+    });
+    state.series.fan = [0.1, 0.5, 0.9].map(p => state.charts.fan.addLineSeries({ 
+        color: p === 0.5 ? '#58a6ff' : 'rgba(88,166,255,0.3)', 
+        lineWidth: p === 0.5 ? 2 : 1 
+    }));
+    state.series.fanBoundary = state.charts.fan.addLineSeries({ color: '#da3633', lineWidth: 2, lineStyle: 2 });
+}
+
+function bindEvents() {
+    document.getElementById('run-btn').onclick = handleRun;
+    document.querySelectorAll('.timeframe-btn').forEach(b => b.onclick = (e) => {
+        document.querySelector('.timeframe-btn.active').classList.remove('active');
+        e.target.classList.add('active');
+        updateMainChart();
+    });
+
+    const toggles = { 'toggle-ma50': 'ma50', 'toggle-ma200': 'ma200', 'toggle-vol': 'volBand' };
+    Object.entries(toggles).forEach(([id, key]) => {
+        document.getElementById(id).onchange = (e) => state.series[key].applyOptions({ visible: e.target.checked });
+    });
+
+    document.getElementById('vol-mode').onchange = (e) => {
+        document.getElementById('rolling-vol-group').classList.toggle('hidden', e.target.value !== 'rolling');
+        document.getElementById('manual-vol-group').classList.toggle('hidden', e.target.value !== 'manual');
+    };
+
+    ['horizon', 'paths', 'lambda'].forEach(id => {
+        const el = document.getElementById(id);
+        el.oninput = () => document.getElementById(`${id}-val`).innerText = el.value;
+    });
+}
+
+async function handleRun() {
+    const ticker = document.getElementById('ticker').value.toUpperCase();
+    state.currency = ticker.endsWith('.NS') || ticker.endsWith('.BO') ? '₹' : '$';
+    
+    // Update formatters
+    [state.charts.main, state.charts.boundary, state.charts.fan].forEach(c => {
+        c.applyOptions({ localization: { priceFormatter: p => `${state.currency}${p.toFixed(2)}` } });
+    });
+
+    setLoading(true, `Syncing ${ticker}...`);
+    
+    try {
+        const data = await fetchData(ticker);
+        state.ohlcv = data.ohlcv;
+        updateStatus(data.source, data.lastDate);
+        updateMainChart();
+        runSim();
+    } catch (e) {
+        alert("Data error: " + e.message);
+    } finally {
+        setLoading(false);
+    }
+}
+
+async function fetchData(ticker) {
+    // 1. Try Live (Stooq)
+    try {
+        const r = await fetch(CONFIG.STOOQ_URL(ticker));
+        if (!r.ok) throw 0;
+        const csv = await r.text();
+        const rows = csv.trim().split('\n').slice(1).map(l => {
+            const [t, o, h, l_, c, v] = l.split(',');
+            return { time: t, open: +o, high: +h, low: +l_, close: +c, volume: +v };
+        }).filter(d => !isNaN(d.close)).sort((a,b) => a.time.localeCompare(b.time));
+        if (rows.length < 10) throw 0;
+        return { ohlcv: rows, source: 'Stooq (Live)', lastDate: rows[rows.length-1].time };
+    } catch {
+        // 2. Fallback to bundled data
+        const fb = ticker.includes('.NS') ? 'data/HDFCBANK.NS_5y.csv' : 'data/HDFCBANK.NS_5y.csv';
+        try {
+            const r = await fetch(fb);
+            if (!r.ok) throw new Error("Local file not found");
+            const csv = await r.text();
+            const rows = csv.trim().split('\n').slice(1).map(l => {
+                const [t, o, h, l_, c, v] = l.split(',');
+                return { time: t, open: +o, high: +h, low: +l_, close: +c, volume: +v };
+            }).filter(d => !isNaN(d.close)).sort((a,b) => a.time.localeCompare(b.time));
+            return { ohlcv: rows, source: 'Fallback (CSV)', lastDate: rows[rows.length-1].time };
+        } catch(e) {
+            throw new Error(`Failed to fetch ${ticker} and no fallback data available.`);
+        }
+    }
+}
+
+function runSim() {
+    const last = state.ohlcv[state.ohlcv.length - 1].close;
+    const sigma = calcSigma();
+    const params = {
+        S0: last,
+        r: +document.getElementById('risk-free').value / 100,
+        q: +document.getElementById('yield').value / 100,
+        sigma,
+        horizon: +document.getElementById('horizon').value,
+        nPaths: +document.getElementById('paths').value,
+        seed: +document.getElementById('seed').value,
+        costBps: +document.getElementById('cost').value,
+        basisDegree: +document.getElementById('basis').value,
+        objectiveMode: document.getElementById('objective').value,
+        lambda: +document.getElementById('lambda').value
+    };
+
+    if (state.worker) state.worker.terminate();
+    state.worker = new Worker('worker.js');
+    state.worker.onmessage = (e) => renderResults(e.data);
+    state.worker.postMessage(params);
+}
+
+function calcSigma() {
+    const mode = document.getElementById('vol-mode').value;
+    if (mode === 'manual') return +document.getElementById('vol-manual').value / 100;
+    const win = +document.getElementById('vol-window').value;
+    const sub = state.ohlcv.slice(-win - 1);
+    const rets = [];
+    for(let i=1; i<sub.length; i++) rets.push(Math.log(sub[i].close / sub[i-1].close));
+    if (rets.length < 2) return 0.25;
+    const mean = rets.reduce((a,b)=>a+b,0)/rets.length;
+    const v = rets.reduce((a,b)=>a+(b-mean)**2,0) / (rets.length - 1);
+    const s = Math.sqrt(v * 252);
+    document.getElementById('sigma-est').innerText = (s * 100).toFixed(1) + '%';
+    return s;
+}
+
+function updateMainChart() {
+    const days = +document.querySelector('.timeframe-btn.active').dataset.days;
+    const sub = state.ohlcv.slice(-days);
+    state.series.candles.setData(sub);
+    
+    // MA
+    [50, 200].forEach(p => {
+        const ma = [];
+        for(let i=p; i<state.ohlcv.length; i++) {
+            const v = state.ohlcv.slice(i-p, i).reduce((a,b)=>a+b.close,0)/p;
+            ma.push({ time: state.ohlcv[i].time, value: v });
+        }
+        state.series[`ma${p}`].setData(ma.filter(d => d.time >= sub[0].time));
+    });
+    state.charts.main.timeScale().fitContent();
+}
+
+function renderResults({ boundary, decision, bands, spot }) {
+    const b0 = boundary[0];
+    const card = document.getElementById('decision-card');
+    card.querySelector('.decision-status').innerText = decision;
+    card.querySelector('.decision-status').className = `decision-status status-${decision.toLowerCase()}`;
+    
+    document.getElementById('boundary-today').innerText = `${state.currency}${b0.toFixed(2)}`;
+    document.getElementById('spot-price').innerText = `${state.currency}${spot.toFixed(2)}`;
+    
+    document.getElementById('rationale').innerText = decision === 'SELL' 
+        ? `Spot ${state.currency}${spot.toFixed(2)} > Boundary ${state.currency}${b0.toFixed(2)}. Liquidation recommended.` 
+        : `Continuation value > Immediate sale. Position is optimal.`;
+
+    state.series.boundaryCurve.setData(boundary.map((v, i) => ({ time: i, value: v })));
+    state.series.boundaryToday.setData(state.ohlcv.slice(-20).map(d => ({ time: d.time, value: b0 })));
+    
+    bands.forEach((b, i) => state.series.fan[i].setData(b.map((v, t) => ({ time: t, value: v }))));
+    state.series.fanBoundary.setData(boundary.map((v, i) => ({ time: i, value: v })));
+    
+    state.charts.boundary.timeScale().fitContent();
+    state.charts.fan.timeScale().fitContent();
+}
+
+function updateStatus(s, d) {
+    document.getElementById('status-source').innerText = s;
+    document.getElementById('status-date').innerText = d;
+}
+
+function setLoading(v, t) {
+    document.getElementById('loading-overlay').classList.toggle('hidden', !v);
+    if(t) document.getElementById('loading-text').innerText = t;
+}
