@@ -23,13 +23,13 @@ export async function fetchData(ticker) {
 
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5y`;
-    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+    // Use corsproxy.io as the primary to avoid QUIC errors on allorigins
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
     
     const response = await fetch(proxyUrl);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
-    const data = await response.json();
-    const json = JSON.parse(data.contents);
+    const json = await response.json();
     
     if (!json.chart?.result?.[0]) {
       throw new Error(json.chart?.error?.description || "No data");
@@ -52,18 +52,21 @@ export async function fetchData(ticker) {
     saveToCache(cacheKey, finalData);
     return finalData;
   } catch (e) {
+    console.warn(`Primary proxy failed for ${ticker}, trying fallback...`, e);
     return fetchViaProxy2(ticker, cacheKey);
   }
 }
 
 async function fetchViaProxy2(ticker, cacheKey) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5y`;
-  const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+  // Fallback to allorigins if corsproxy fails
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}&timestamp=${Date.now()}`;
   
   const response = await fetch(proxyUrl);
   if (!response.ok) throw new Error("Sources exhausted");
   
-  const json = await response.json();
+  const data = await response.json();
+  const json = JSON.parse(data.contents);
   const result = json.chart.result[0];
   const indicators = result.indicators.quote[0];
 
