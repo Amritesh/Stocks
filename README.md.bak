@@ -1,0 +1,38 @@
+# QuantStop - Optimal Liquidation Simulator
+
+A production-grade, 100% static quant tool for determining optimal stock liquidation points using the **Longstaff-Schwartz (LSMC)** method. Optimized for Indian and Global markets.
+
+## Features
+- **Real-time Data**: Fetches from Stooq (CORS-friendly CSV). Supports NSE/BSE via `.NS` or `.BO` tickers.
+- **Reliable Fallback**: Automatically uses local datasets in `/data` if APIs are blocked or rate-limited.
+- **Advanced Charting**: Professional-grade interactive charts built with TradingView Lightweight Charts.
+- **LSMC Engine**: Multi-threaded simulation using Web Workers for high-performance Monte Carlo paths.
+- **Mathematical Levers**:
+    - Risk-neutral GBM path generation.
+    - Polynomial basis regression (degree 2 or 3).
+    - Transaction cost modeling (bps).
+    - Mean-Variance risk preference penalty.
+    - Automatic currency detection (₹ for Indian stocks, $ for Global).
+
+## Mathematical Core
+The simulator solves the optimal stopping problem for a seller using backward induction:
+$$V_t(S) = \max( S \cdot (1 - \text{cost}), e^{-r \cdot dt} \mathbb{E}[V_{t+dt}(S_{t+dt}) | S_t] )$$
+The continuation value is approximated via least-squares regression on simulated paths, allowing the tool to calculate the precise "Sell Boundary" for each day in the horizon.
+
+## How to Deploy (GitHub Pages)
+1. Fork or upload this repository to GitHub.
+2. Go to **Settings > Pages**.
+3. Select the `main` branch and `/ (root)` folder.
+4. Your site will be live at `https://<user>.github.io/<repo>/`.
+
+## Limitations
+- **Model Risk**: Assumes Geometric Brownian Motion (log-normal). Does not account for fat tails, jumps, or regime changes.
+- **Execution**: Ignores market impact, slippage (beyond fixed bps), and order book depth.
+- **Tax/Legal**: Does not consider capital gains tax or specific corporate actions.
+
+## Local Development
+Simply open `index.html` in any modern browser. For best results (to avoid CORS restrictions on local file access for CSVs), use a simple server:
+```bash
+python3 -m http.server 8000
+```
+Then navigate to `http://localhost:8000`.
