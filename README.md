@@ -14,3 +14,23 @@ The React Compiler is not enabled on this template because of its impact on dev 
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+# Stocks Monte Carlo Dashboard
+
+## New backend scaffold (physics-inspired engine)
+
+- FastAPI app in `server/main.py` with `/run` and `/prices/{ticker}` endpoints.
+- Data providers abstraction in `server/services/data_provider/` (Yahoo stub).
+- Engine placeholder in `server/services/engine.py` that will be replaced by full factor/regime models.
+- Install backend deps: `python -m venv .venv && source .venv/bin/activate && pip install -r server/requirements.txt`
+- Run backend: `uvicorn server.main:app --reload --port 8000`
+
+## Frontend additions
+
+- API client in `src/api/client.js` hits local FastAPI.
+- Decision boundary tab added with CE comparison placeholder.
+
+## Next steps to productionize models
+
+- Replace engine placeholder with Stage 1 Kalman + Student-t, posterior predictive.
+- Add HMM/regime, jump components per spec.
+- Wire charts for betas, regimes, predictive histograms, diagnostics.

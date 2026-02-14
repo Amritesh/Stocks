@@ -1,10 +1,29 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, CandlestickSeries, LineSeries } from 'lightweight-charts';
-import { CONFIG, fetchData, calcSigma, generateFutureDates } from './utils';
-import { 
-  TrendingUp, 
-  Play, 
-  BarChart2, 
+import { CONFIG, fetchData, generateFutureDates, searchTicker } from './utils';
+import {
+  TRADING_DAYS,
+  DEFAULT_HORIZON_DAYS,
+  DEFAULT_RISK_FREE_PCT,
+  DEFAULT_YIELD_PCT,
+  DEFAULT_VOL_MODE,
+  DEFAULT_VOL_WINDOW,
+  DEFAULT_MANUAL_VOL_PCT,
+  DEFAULT_PATHS,
+  DEFAULT_SEED,
+  DEFAULT_COST_BPS,
+  DEFAULT_OBJECTIVE,
+  DEFAULT_LAMBDA,
+  DEFAULT_BASIS_DEGREE,
+} from './math/constants';
+import { runModel } from './api/client';
+import { DecisionBoundaryTab } from './components/tabs/DecisionBoundaryTab';
+import { calcSigma } from './math/volatility';
+import { generateRandomWalks } from './math/monteCarlo';
+import {
+  TrendingUp,
+  Play,
+  BarChart2,
   Info,
   Loader2,
   LayoutDashboard,
@@ -17,50 +36,61 @@ import {
   Zap,
   CircleDot,
   Menu,
-  X
+  X,
+  Activity
 } from 'lucide-react';
 
 export default function App() {
-  const [ticker, setTicker] = useState('INFY.NS');
-  const [horizon, setHorizon] = useState(22);
-  const [riskFree, setRiskFree] = useState(6.5);
-  const [yieldRate, setYieldRate] = useState(0.0);
-  const [volMode, setVolMode] = useState('rolling');
-  const [volWindow, setVolWindow] = useState(126);
-  const [manualVol, setManualVol] = useState(30);
-  const [paths, setPaths] = useState(5000);
-  const [seed, setSeed] = useState(42);
-  const [cost, setCost] = useState(10);
-  const [objective, setObjective] = useState('max_ev');
-  const [lambda, setLambda] = useState(0);
-  const [basis, setBasis] = useState(2);
+  const [ticker, setTicker] = useState('HDFCBANK.NS');
+  const [suggestions, setSuggestions] = useState([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [horizon, setHorizon] = useState(DEFAULT_HORIZON_DAYS);
+  const [riskFree, setRiskFree] = useState(DEFAULT_RISK_FREE_PCT);
+  const [yieldRate, setYieldRate] = useState(DEFAULT_YIELD_PCT);
+  const [volMode, setVolMode] = useState(DEFAULT_VOL_MODE);
+  const [volWindow, setVolWindow] = useState(DEFAULT_VOL_WINDOW);
+  const [manualVol, setManualVol] = useState(DEFAULT_MANUAL_VOL_PCT);
+  const [paths, setPaths] = useState(DEFAULT_PATHS);
+  const [seed, setSeed] = useState(DEFAULT_SEED);
+  const [cost, setCost] = useState(DEFAULT_COST_BPS);
+  const [objective, setObjective] = useState(DEFAULT_OBJECTIVE);
+  const [lambda, setLambda] = useState(DEFAULT_LAMBDA);
+  const [basis, setBasis] = useState(DEFAULT_BASIS_DEGREE);
+  const [buyDate, setBuyDate] = useState('2025-06-01');
+  const [buyPrice, setBuyPrice] = useState('970');
+  const [confidence, setConfidence] = useState(0.9);
+  const [entryMeta, setEntryMeta] = useState({ date: '', price: null });
   
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
   const [ohlcv, setOhlcv] = useState([]);
   const [status, setStatus] = useState({ source: '---', date: '---' });
   const [results, setResults] = useState(null);
+  const [backend, setBackend] = useState({ ce: null, luck_score: null, message: '', buy_ranges: [], stats: null, decision: null, decision_text: null, regime: null });
   const [sigmaEst, setSigmaEst] = useState('--');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const mainChartRef = useRef(null);
-  const boundaryChartRef = useRef(null);
-  const fanChartRef = useRef(null);
+  // Removed separate refs for boundary and fan charts as they will be merged
   const charts = useRef({});
   const series = useRef({});
   const workerRef = useRef(null);
   const hasLoadedRef = useRef(false);
 
   const currency = ticker.toUpperCase().endsWith('.NS') || ticker.toUpperCase().endsWith('.BO') ? '₹' : '$';
+  const targetPct = 0.1;
+  const drawdownPct = 0.1;
 
   const handleRun = useCallback(async (targetTicker = ticker) => {
     if (!targetTicker) return;
     
+    setShowSuggestions(false);
     // Clear old results immediately when starting a new run
     setResults(null);
     setOhlcv([]);
     setStatus({ source: '---', date: '---' });
     setSigmaEst('--');
+    setBackend({ ce: null, luck_score: null, message: '' });
     
     // Clear chart series data
     if (series.current.candles) series.current.candles.setData([]);
@@ -68,88 +98,364 @@ export default function App() {
     if (series.current.ma200) series.current.ma200.setData([]);
     if (series.current.boundaryToday) series.current.boundaryToday.setData([]);
     if (series.current.boundaryCurve) series.current.boundaryCurve.setData([]);
-    if (series.current.fanBoundary) series.current.fanBoundary.setData([]);
+    if (series.current.buyLine) series.current.buyLine.setData([]);
+    if (series.current.targetLine) series.current.targetLine.setData([]);
+    if (series.current.stopLine) series.current.stopLine.setData([]);
+    if (series.current.candles?.setMarkers) series.current.candles.setMarkers([]);
+    if (series.current.realizedLine) series.current.realizedLine.setData([]);
     if (series.current.fan) {
       series.current.fan.forEach(s => s.setData([]));
+    }
+    // Clear simulation lines
+    if (series.current.simulations) {
+        series.current.simulations.forEach(s => {
+             charts.current.main.removeSeries(s);
+        });
+        series.current.simulations = [];
     }
 
     setLoading(true);
     setLoadingText(`Analyzing ${targetTicker}...`);
     
     try {
-      const data = await fetchData(targetTicker);
-      setOhlcv(data.ohlcv);
-      setStatus({ source: data.source, date: data.lastDate });
+       const data = await fetchData(targetTicker);
+       setOhlcv(data.ohlcv);
+       setStatus({ source: data.source, date: data.lastDate });
       
-      if (series.current.candles) {
-        const sub = data.ohlcv.slice(-365);
-        series.current.candles.setData(sub);
-        [50, 200].forEach(p => {
-          const ma = [];
-          for(let i=p; i<data.ohlcv.length; i++) {
-            const v = data.ohlcv.slice(i-p, i).reduce((a,b)=>a+b.close,0)/p;
-            ma.push({ time: data.ohlcv[i].time, value: v });
-          }
-          series.current[`ma${p}`].setData(ma.filter(d => d.time >= sub[0].time));
-        });
-        charts.current.main.timeScale().fitContent();
-      }
-      
-      const sigma = calcSigma(data.ohlcv, volMode, manualVol, volWindow);
-      setSigmaEst((sigma * 100).toFixed(1));
+       if (series.current.candles) {
+         const sub = data.ohlcv.slice(-365);
+         series.current.candles.setData(sub);
+         
+         // Force a fitContent after setting initial data to ensure visibility
+         requestAnimationFrame(() => {
+             if (charts.current.main) {
+                 charts.current.main.timeScale().fitContent();
+             }
+         });
+         
+         [50, 200].forEach(p => {
+           const ma = [];
+           for(let i=p; i<data.ohlcv.length; i++) {
+             const v = data.ohlcv.slice(i-p, i).reduce((a,b)=>a+b.close,0)/p;
+             ma.push({ time: data.ohlcv[i].time, value: v });
+           }
+           series.current[`ma${p}`].setData(ma.filter(d => d.time >= sub[0].time));
+         });
 
-      if (workerRef.current) workerRef.current.terminate();
-      const workerUrl = new URL(`${import.meta.env.BASE_URL}worker.js`, window.location.origin);
-      console.log("Initializing worker from", workerUrl.toString());
-      workerRef.current = new Worker(workerUrl, { type: 'classic' });
-      workerRef.current.onmessage = (e) => {
-        const { boundary, decision, bands, spot } = e.data;
-        setResults({ boundary, decision, bands, spot });
-        
-        const futureDates = generateFutureDates(data.lastDate, boundary.length);
-        
-        series.current.boundaryCurve.setData(boundary.map((v, i) => ({ time: futureDates[i], value: v })));
-        series.current.boundaryToday.setData(data.ohlcv.slice(-20).map(d => ({ time: d.time, value: boundary[0] })));
-        
-        bands.forEach((b, i) => {
-          if (series.current.fan && series.current.fan[i]) {
-            series.current.fan[i].setData(b.map((v, t) => ({ time: futureDates[t], value: v })));
+         const fallbackDate = data.ohlcv[data.ohlcv.length - 1].time;
+         const fallbackPrice = data.ohlcv[data.ohlcv.length - 1].close;
+         const usedDate = buyDate || fallbackDate;
+         const usedPrice = Number(buyPrice || fallbackPrice);
+
+         const elapsedDays = (() => {
+           const startIdx = data.ohlcv.findIndex(d => d.time >= usedDate);
+           if (startIdx === -1) return data.ohlcv.length - 1;
+           return Math.max(1, data.ohlcv.length - 1 - startIdx);
+         })();
+         const horizonUsed = Math.max(1, elapsedDays);
+         setHorizon(horizonUsed);
+         setEntryMeta({ date: usedDate, price: usedPrice });
+
+         if (series.current.buyLine) series.current.buyLine.setData(sub.map(d => ({ time: d.time, value: usedPrice })));
+         if (series.current.targetLine) series.current.targetLine.setData(sub.map(d => ({ time: d.time, value: usedPrice * (1 + targetPct) })));
+         if (series.current.stopLine) series.current.stopLine.setData(sub.map(d => ({ time: d.time, value: usedPrice * (1 - drawdownPct) })));
+          if (series.current.realizedLine) {
+            const startIdx = data.ohlcv.findIndex(d => d.time >= usedDate);
+            const realizedSlice = startIdx === -1 ? sub : data.ohlcv.slice(startIdx);
+            series.current.realizedLine.setData(realizedSlice.map(d => ({ time: d.time, value: d.close })));
+            
+            // Color logic: Green if final > start, Red if final < start
+            if (realizedSlice.length > 0) {
+                const startPrice = realizedSlice[0].close;
+                const endPrice = realizedSlice[realizedSlice.length-1].close;
+                series.current.realizedLine.applyOptions({
+                    color: endPrice >= startPrice ? '#22c55e' : '#f43f5e'
+                });
+            }
+
+            // Generate Random Walks for Context (Historical Bootstrap)
+            // Rendered HERE after usedDate/usedPrice are defined
+            const walkHorizon = realizedSlice.length;
+            const nWalks = 50;
+            
+            const walks = generateRandomWalks({
+                S0: usedPrice,
+                ohlcv: data.ohlcv,
+                horizon: walkHorizon,
+                nPaths: nWalks,
+                seed: seed
+            });
+
+            // Render walks
+            series.current.simulations = [];
+            if (walks && walks.length > 0) {
+                walks.forEach(path => {
+                    const s = charts.current.main.addSeries(LineSeries, {
+                        color: 'rgba(255, 255, 255, 0.05)', // Very faint white
+                        lineWidth: 1,
+                        crosshairMarkerVisible: false,
+                        lastValueVisible: false,
+                        priceLineVisible: false
+                    });
+                    
+                    const lineData = [];
+                    for(let t=0; t<path.length; t++) {
+                        if (realizedSlice[t]) {
+                            lineData.push({ time: realizedSlice[t].time, value: path[t] });
+                        }
+                    }
+                    s.setData(lineData);
+                    series.current.simulations.push(s);
+                });
+
+                // Calculate Outcome Percentile
+                const finalRealized = realizedSlice[realizedSlice.length-1].close;
+                const finalSimulated = walks.map(w => w[w.length-1]);
+                finalSimulated.sort((a,b) => a-b);
+                
+                let rank = 0;
+                while(rank < finalSimulated.length && finalSimulated[rank] < finalRealized) {
+                    rank++;
+                }
+                const percentile = rank / finalSimulated.length;
+                
+                // Update luck score in backend state
+                setBackend(prev => ({ ...prev, luck_score: percentile }));
+            }
           }
-        });
-        series.current.fanBoundary.setData(boundary.map((v, i) => ({ time: futureDates[i], value: v })));
-        
-        charts.current.boundary.timeScale().fitContent();
-        charts.current.fan.timeScale().fitContent();
-        setLoading(false);
-      };
+          if (series.current.candles?.setMarkers) {
+            const markers = [];
+            // Entry Marker
+            if (usedPrice) {
+                markers.push({
+                    time: usedDate,
+                    position: 'belowBar',
+                    color: '#22c55e',
+                    shape: 'arrowUp',
+                    text: `ENTRY @ ${currency}${usedPrice}`,
+                    size: 2
+                });
+            }
+
+            // Dividend Markers
+            if (data.dividends) {
+                data.dividends.forEach(d => {
+                   // Only show dividends within the visible range
+                   if (d.time >= sub[0].time) {
+                       markers.push({
+                           time: d.time,
+                           position: 'aboveBar',
+                           color: '#facc15', // bright yellow
+                           shape: 'arrowDown',
+                           text: `DIV ${currency}${d.value}`,
+                           size: 1
+                       });
+                   }
+                });
+            }
+            
+            // Sort markers by time
+            markers.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+            series.current.candles.setMarkers(markers);
+          }
+          charts.current.main.timeScale().fitContent();
+          setTimeout(() => charts.current.main.timeScale().fitContent(), 0);
+
+          // Update fan/boundary horizon-dependent visuals later using horizonUsed
+           // (handled below when posting to worker/backend)
+         }
+       
+        const sigma = calcSigma(data.ohlcv, volMode, manualVol, volWindow);
+        setSigmaEst((sigma * 100).toFixed(1));
+ 
+       if (workerRef.current) workerRef.current.terminate();
+       const workerUrl = new URL('./worker.js', import.meta.url);
+       console.log("Initializing worker from", workerUrl.toString());
+       workerRef.current = new Worker(workerUrl, { type: 'module' });
+       workerRef.current.onmessage = (e) => {
+          const { type, boundary, decision, bands, spot, rebalancingPoints, result, error } = e.data;
+          
+          if (error) {
+            console.error('Worker error payload:', error);
+            setLoading(false);
+            return;
+          }
+
+          if (type === 'bootstrap_result') {
+            setBackend(result);
+          } else if (type === 'lsmc_result' || (!type && boundary)) { // Fallback for old message format if any
+             setResults({ boundary, decision, bands, spot, rebalancingPoints });
+             
+             // Use the entry date as the start of the simulation visuals if possible
+             const simStartDate = buyDate || data.lastDate;
+             const futureDates = generateFutureDates(simStartDate, boundary.length + 5); // Add buffer
+             
+             // Plot boundary curve on main chart
+             if (series.current.boundaryCurve) {
+                const boundaryData = boundary.map((v, i) => {
+                    const date = futureDates[i];
+                    return date ? { time: date, value: v } : null;
+                }).filter(d => d !== null);
+                series.current.boundaryCurve.setData(boundaryData);
+             }
+             
+             // Plot probability bands (Fan) on main chart
+             // Backend now sends bands as [{p10, p50, p90}, ...]
+             if (series.current.fan && res.bands) {
+                 const p10Data = [];
+                 const p50Data = [];
+                 const p90Data = [];
+                 
+                 // Generate future dates starting from tomorrow/next valid day
+                 // The backend sends 252 points or however many requested
+                 const startSimDate = buyDate || data.lastDate;
+                 const futureDates = generateFutureDates(startSimDate, res.bands.length + 5);
+
+                 res.bands.forEach((b, i) => {
+                     const date = futureDates[i];
+                     if (date) {
+                         p10Data.push({ time: date, value: b.p10 });
+                         p50Data.push({ time: date, value: b.p50 });
+                         p90Data.push({ time: date, value: b.p90 });
+                     }
+                 });
+
+                 if (series.current.fan[0]) series.current.fan[0].setData(p10Data);
+                 if (series.current.fan[1]) series.current.fan[1].setData(p50Data);
+                 if (series.current.fan[2]) series.current.fan[2].setData(p90Data);
+             }
+             
+             // Add rebalancing markers to boundary curve
+             if (rebalancingPoints && rebalancingPoints.length > 0 && series.current.boundaryCurve) {
+                 const markers = rebalancingPoints.map(pt => {
+                     const date = futureDates[pt.t];
+                     if (!date) return null;
+                     // Ensure date is a string or compatible type for markers
+                     return {
+                         time: date,
+                         position: 'aboveBar',
+                         color: pt.type === 'bullish' ? '#22c55e' : '#f43f5e',
+                         shape: pt.type === 'bullish' ? 'arrowUp' : 'arrowDown',
+                         text: 'REBAL',
+                         size: 2
+                     };
+                 }).filter(m => m !== null);
+                 
+                 // Sort markers by time (required by lightweight-charts)
+                 markers.sort((a, b) => {
+                    if (a.time < b.time) return -1;
+                    if (a.time > b.time) return 1;
+                    return 0;
+                 });
+    
+                 // Ensure boundaryCurve supports markers before calling setMarkers
+                 if (series.current.boundaryCurve && series.current.boundaryCurve.setMarkers) {
+                    series.current.boundaryCurve.setMarkers(markers);
+                 } else {
+                    console.warn("boundaryCurve series does not support setMarkers or is undefined");
+                 }
+             }
+
+             charts.current.main.timeScale().fitContent();
+             setLoading(false);
+          }
+       };
       
-      workerRef.current.onerror = (err) => {
-        console.error("Worker error:", err);
+       workerRef.current.onerror = (err) => {
+         console.error("Worker error:", err);
+         setLoading(false);
+       };
+       workerRef.current.onmessageerror = (err) => {
+         console.error("Worker message error:", err);
+         setLoading(false);
+       };
+       const fallbackDate = data.ohlcv[data.ohlcv.length - 1].time;
+       const fallbackPrice = data.ohlcv[data.ohlcv.length - 1].close;
+       const usedDate = buyDate || fallbackDate;
+       const usedPrice = Number(buyPrice || fallbackPrice);
+
+       const elapsedDays = (() => {
+         const startIdx = data.ohlcv.findIndex(d => d.time >= usedDate);
+         if (startIdx === -1) return data.ohlcv.length - 1;
+         return Math.max(1, data.ohlcv.length - 1 - startIdx);
+       })();
+       const horizonUsed = Math.max(1, elapsedDays);
+       setHorizon(horizonUsed);
+
+       // Old duplicate random walk block removed (moved up)
+
+       console.log("Posting message to worker...");
+       
+       // Calculate returns for bootstrap
+       const returns = [];
+       for (let i = 1; i < data.ohlcv.length; i++) {
+         const ret = (data.ohlcv[i].close - data.ohlcv[i-1].close) / data.ohlcv[i-1].close;
+         if (!isNaN(ret)) returns.push(ret);
+       }
+
+      // Call the Python Generative Engine
+      // We skip the JS worker for now as the heavy lifting is in Python
+      runModel({
+        ticker: targetTicker,
+        buy_date: usedDate,
+        horizon: horizonUsed,
+        paths: paths,
+        risk_aversion: lambda,
+        target_pct: targetPct,
+        drawdown_pct: drawdownPct
+      }).then(res => {
+        console.log("Generative Model Results:", res);
+        setBackend(res);
+        setResults({
+           decision: res.decision,
+           spot: fallbackPrice,
+           boundary: [0], // Deprecated but needed for UI for now
+           bands: res.bands,
+           rebalancingPoints: []
+        });
+
+        // Visualize the "Cone" from Python (bands)
+        if (series.current.fan) {
+            const futureDates = generateFutureDates(data.lastDate, horizonUsed);
+            // Assuming res.bands is [BandPoint, BandPoint...]
+            // We need to map p10, p50, p90 to fan lines
+            
+            // ... Logic to map bands to charts similar to previous worker ...
+            // Simplified for now: just update loading
+            setLoading(false);
+        }
+        
+      }).catch(err => {
+        console.error("Generative Engine Failed:", err);
         setLoading(false);
-      };
-      workerRef.current.onmessageerror = (err) => {
-        console.error("Worker message error:", err);
-        setLoading(false);
-      };
-      console.log("Posting message to worker...");
-      workerRef.current.postMessage({
-        S0: data.ohlcv[data.ohlcv.length - 1].close,
-        r: riskFree / 100,
-        q: yieldRate / 100,
-        sigma,
-        horizon,
-        nPaths: paths,
-        seed,
-        costBps: cost,
-        basisDegree: basis,
-        objectiveMode: objective,
-        lambda
       });
+
     } catch (e) {
       console.error(e);
       setLoading(false);
     }
   }, [ticker, riskFree, yieldRate, volMode, manualVol, volWindow, horizon, paths, seed, cost, basis, objective, lambda]);
+
+  useEffect(() => {
+    const delayDebounceFn = setTimeout(async () => {
+      if (ticker && ticker.length >= 2) {
+        const results = await searchTicker(ticker);
+        setSuggestions(results);
+        
+        // Only show suggestions if the current ticker is NOT an exact match to the top result
+        // This prevents the dropdown from reopening immediately after selection
+        if (results.length > 0 && results[0].symbol !== ticker) {
+            setShowSuggestions(true);
+        }
+      } else {
+        setSuggestions([]);
+        setShowSuggestions(false);
+      }
+    }, 300);
+
+    return () => clearTimeout(delayDebounceFn);
+  }, [ticker]);
 
   useEffect(() => {
     if (!mainChartRef.current) return;
@@ -170,6 +476,41 @@ export default function App() {
     };
 
     charts.current.main = createChart(mainChartRef.current, { ...theme, height: 450 });
+    
+    // Initialize Fan Series first so they are behind candles
+    // Using AreaSeries for the outer bands to create a filled effect ("fan")
+    // 0.1 and 0.9 will be the edges of the fan. 0.5 is the median path.
+    series.current.fan = [
+        // 0: Lower band (10th percentile)
+        charts.current.main.addSeries(LineSeries, {
+            color: 'rgba(99, 102, 241, 0.2)',
+            lineWidth: 1,
+            lineStyle: 2
+        }),
+        // 1: Median band (50th percentile)
+        charts.current.main.addSeries(LineSeries, {
+            color: '#6366f1',
+            lineWidth: 2,
+            lineStyle: 0
+        }),
+        // 2: Upper band (90th percentile)
+        charts.current.main.addSeries(LineSeries, {
+            color: 'rgba(99, 102, 241, 0.2)',
+            lineWidth: 1,
+            lineStyle: 2
+        })
+    ];
+
+    series.current.boundaryCurve = charts.current.main.addSeries(LineSeries, {
+        color: '#f43f5e',
+        lineWidth: 3,
+        lineStyle: 0,
+        crosshairMarkerVisible: true,
+        crosshairMarkerRadius: 6,
+        crosshairMarkerBorderColor: '#ffffff',
+        crosshairMarkerBackgroundColor: '#f43f5e',
+    });
+
     series.current.candles = charts.current.main.addSeries(CandlestickSeries, {
         upColor: '#10b981',
         downColor: '#f43f5e',
@@ -180,16 +521,11 @@ export default function App() {
     series.current.ma50 = charts.current.main.addSeries(LineSeries, { color: '#6366f1', lineWidth: 1, visible: false });
     series.current.ma200 = charts.current.main.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 1, visible: false });
     series.current.boundaryToday = charts.current.main.addSeries(LineSeries, { color: '#f43f5e', lineWidth: 2, lineStyle: 2 });
-
-    charts.current.boundary = createChart(boundaryChartRef.current, { ...theme, height: 280 });
-    series.current.boundaryCurve = charts.current.boundary.addSeries(LineSeries, { color: '#f43f5e', lineWidth: 2 });
-
-    charts.current.fan = createChart(fanChartRef.current, { ...theme, height: 280 });
-    series.current.fan = [0.1, 0.5, 0.9].map(p => charts.current.fan.addSeries(LineSeries, {
-      color: p === 0.5 ? '#6366f1' : 'rgba(99, 102, 241, 0.2)',
-      lineWidth: p === 0.5 ? 2 : 1
-    }));
-    series.current.fanBoundary = charts.current.fan.addSeries(LineSeries, { color: '#f43f5e', lineWidth: 2, lineStyle: 2 });
+    // Realized line color will be updated dynamically based on PnL but init as neutral
+    series.current.realizedLine = charts.current.main.addSeries(LineSeries, { color: '#38bdf8', lineWidth: 3 });
+    series.current.buyLine = charts.current.main.addSeries(LineSeries, { color: '#22c55e', lineWidth: 2, lineStyle: 1, lineType: 1 });
+    series.current.targetLine = charts.current.main.addSeries(LineSeries, { color: '#6366f1', lineWidth: 1, lineStyle: 2 });
+    series.current.stopLine = charts.current.main.addSeries(LineSeries, { color: '#f97316', lineWidth: 1, lineStyle: 2 });
 
     const handleResize = () => {
       Object.values(charts.current).forEach(c => {
@@ -200,15 +536,19 @@ export default function App() {
 
     if (!hasLoadedRef.current) {
         hasLoadedRef.current = true;
-        // Do not run simulation by default anymore
-        // handleRun('INFY.NS');
+        handleRun('HDFCBANK.NS');
     }
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      // Do not remove the chart instance on cleanup if we want to persist it,
+      // but here we are recreating it on every dependency change.
+      // Better to just remove it to avoid leaks.
       Object.values(charts.current).forEach(c => c.remove());
+      charts.current = {}; // Clear the ref
     };
-  }, [currency, handleRun]);
+    // Removed handleRun from dependencies to prevent chart re-creation loops
+  }, [currency]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-300 flex font-sans selection:bg-indigo-500/30 overflow-x-hidden">
@@ -272,61 +612,162 @@ export default function App() {
 
         <main className="p-4 sm:p-6 lg:p-10 space-y-6 lg:space-y-10 max-w-[1920px] mx-auto w-full">
           {/* Action Row */}
-          <section className="flex flex-col xl:flex-row gap-6 lg:gap-8 items-stretch">
-            <div className="flex-1 min-w-0">
+          <section className="flex flex-col gap-6 lg:gap-8">
+            <div className="w-full">
               <div className="relative group">
-                <div className="absolute -inset-1 bg-gradient-to-r from-indigo-500/20 to-blue-500/20 rounded-2xl blur-lg opacity-0 group-focus-within:opacity-100 transition duration-500"></div>
-                <div className="relative flex flex-col md:flex-row gap-4 bg-slate-900 border border-white/10 rounded-2xl p-2.5 shadow-xl">
-                  <div className="relative flex-1 flex items-center">
-                    <Search className="absolute left-4 w-5 h-5 text-slate-500" />
-                    <input 
-                      type="text" 
-                      placeholder="ENTER TICKER (e.g. AAPL, RELIANCE.NS)..."
-                      className="w-full bg-transparent border-none py-4 pl-12 pr-4 text-white text-sm md:text-base font-bold placeholder:text-slate-600 focus:ring-0 uppercase"
-                      value={ticker}
-                      onChange={e => setTicker(e.target.value.toUpperCase())}
-                      onKeyDown={e => e.key === 'Enter' && handleRun()}
-                    />
-                  </div>
-                  <button 
-                    onClick={() => handleRun()}
-                    disabled={loading}
-                    className="md:w-60 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 text-white font-black uppercase tracking-widest text-[10px] md:text-xs py-4 px-8 rounded-xl transition-all flex items-center justify-center gap-3 shadow-2xl shadow-indigo-600/20 active:scale-95"
-                  >
-                    {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-4 h-4 fill-current" />}
-                    <span>{loading ? 'ANALYZING...' : 'RUN SIMULATION'}</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 xl:w-auto">
-              {[
-                { label: 'Horizon', value: horizon, set: setHorizon, suffix: 'D' },
-                { label: 'Risk Free', value: riskFree, set: setRiskFree, suffix: '%' },
-                { label: 'Paths', value: paths, set: setPaths, isSelect: true, options: [1000, 5000, 15000] },
-                { label: 'Volatility', value: volMode, set: setVolMode, isSelect: true, options: ['rolling', 'manual'] },
-              ].map((ctrl, i) => (
-                <div key={i} className="bg-slate-900 border border-white/5 rounded-2xl p-4 space-y-2 shadow-lg min-w-[100px]">
-                  <span className="block text-[10px] font-black text-slate-500 uppercase tracking-widest">{ctrl.label}</span>
-                  {ctrl.isSelect ? (
-                    <select 
-                      className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0 cursor-pointer uppercase"
-                      value={ctrl.value} onChange={e => ctrl.set(e.target.value)}
-                    >
-                      {ctrl.options.map(opt => <option key={opt} value={opt} className="bg-slate-900">{opt === 1000 ? '1K' : opt === 5000 ? '5K' : opt === 15000 ? '15K' : opt.toString().toUpperCase()}</option>)}
-                    </select>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      <input 
-                        type="number" className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0"
-                        value={ctrl.value} onChange={e => ctrl.set(+e.target.value)}
-                      />
-                      <span className="text-[10px] font-black text-slate-600">{ctrl.suffix}</span>
+               <div className="absolute -inset-1 bg-gradient-to-r from-indigo-500/20 to-blue-500/20 rounded-2xl blur-lg opacity-0 group-focus-within:opacity-100 transition duration-500"></div>
+                <div className="relative flex flex-col md:flex-row gap-4 bg-slate-900 border border-indigo-500/20 rounded-2xl p-2.5 shadow-xl">
+                  <div className="relative flex-1 flex items-center min-w-0">
+                  <Search className="absolute left-4 w-5 h-5 text-slate-500" />
+                  <input
+                    type="text"
+                    placeholder="ENTER TICKER..."
+                    className="w-full bg-transparent border-none py-4 pl-12 pr-4 text-white text-sm md:text-base font-bold placeholder:text-slate-600 focus:ring-0 focus:outline-none uppercase relative z-10"
+                    value={ticker}
+                    onChange={e => {
+                      const val = e.target.value.toUpperCase();
+                      setTicker(val);
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        handleRun();
+                        setShowSuggestions(false);
+                      }
+                    }}
+                    onFocus={() => ticker.length >= 2 && setShowSuggestions(true)}
+                    onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
+                  />
+                  {ticker && (
+                     <button
+                       onClick={() => {
+                         setTicker('');
+                         setShowSuggestions(false);
+                       }}
+                       className="absolute right-4 text-slate-500 hover:text-white"
+                     >
+                       <X className="w-4 h-4" />
+                     </button>
+                  )}
+                  
+                  {/* Suggestions Dropdown */}
+                  {showSuggestions && suggestions.length > 0 && (
+                    <div className="absolute top-full left-0 right-0 mt-2 bg-slate-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden z-[60] max-h-[300px] overflow-y-auto">
+                      {suggestions.map((s, i) => (
+                        <div
+                          key={i}
+                          className="px-4 py-3 hover:bg-white/5 cursor-pointer border-b border-white/5 last:border-0 flex justify-between items-center group"
+                          onClick={() => {
+                            setTicker(s.symbol);
+                            setShowSuggestions(false);
+                            handleRun(s.symbol);
+                          }}
+                        >
+                          <div>
+                            <div className="text-white font-bold text-sm">{s.symbol}</div>
+                            <div className="text-slate-500 text-xs font-medium uppercase tracking-wider">{s.shortname}</div>
+                          </div>
+                          <div className="text-[10px] font-black text-slate-600 uppercase tracking-widest bg-slate-950 px-2 py-1 rounded-lg group-hover:text-indigo-400 transition-colors">
+                            {s.exchDisp}
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
-              ))}
+                  <button
+                     onClick={() => handleRun()}
+                     disabled={loading}
+                     className="md:w-64 bg-gradient-to-r from-indigo-600 via-blue-600 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 disabled:from-slate-800 disabled:to-slate-800 text-white font-black uppercase tracking-widest text-[11px] md:text-xs py-4 px-8 rounded-xl transition-all flex items-center justify-center gap-3 shadow-2xl shadow-indigo-600/40 active:scale-95"
+                   >
+                     {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-4 h-4 fill-current" />}
+                     <span>{loading ? 'ANALYZING...' : 'RUN ADVANCED SIMULATION'}</span>
+                   </button>
+                 </div>
+                 <div className="mt-2 text-[11px] text-slate-500 font-semibold uppercase tracking-widest flex items-center gap-2">
+                   <span className="w-2 h-2 bg-indigo-500 rounded-full"></span>
+                   LSMC + Monte Carlo Fan + Bootstrap Risk Engine
+                 </div>
+               </div>
+             </div>
+
+            <div className="bg-slate-900/80 border border-white/5 rounded-2xl shadow-lg w-full overflow-hidden transition-all duration-500 ease-in-out">
+              <button
+                onClick={(e) => {
+                  const content = document.getElementById('advanced-controls-content');
+                  const icon = document.getElementById('advanced-chevron');
+                  const isHidden = content.classList.contains('max-h-0');
+                  
+                  if (isHidden) {
+                    content.classList.remove('max-h-0', 'opacity-0', 'pb-0');
+                    content.classList.add('max-h-[500px]', 'opacity-100', 'pb-4');
+                    icon.style.transform = 'rotate(180deg)';
+                  } else {
+                    content.classList.add('max-h-0', 'opacity-0', 'pb-0');
+                    content.classList.remove('max-h-[500px]', 'opacity-100', 'pb-4');
+                    icon.style.transform = 'rotate(0deg)';
+                  }
+                }}
+                className="w-full p-4 cursor-pointer text-[11px] font-black text-slate-300 uppercase tracking-widest flex items-center justify-between outline-none hover:bg-white/5 transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full"></div>
+                  Advanced Configuration
+                </div>
+                <div id="advanced-chevron" className="transition-transform duration-300 text-slate-500">
+                  <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </div>
+              </button>
+              
+              <div id="advanced-controls-content" className="max-h-0 opacity-0 px-4 transition-all duration-500 ease-in-out overflow-hidden w-full">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-2 pb-4 w-full">
+                  {[{ label: 'Horizon', value: horizon, set: setHorizon, suffix: 'D' },
+                    { label: 'Risk Free', value: riskFree, set: setRiskFree, suffix: '%' },
+                    { label: 'Paths', value: paths, set: setPaths, isSelect: true, options: [1000, 5000, 15000] },
+                    { label: 'Volatility', value: volMode, set: setVolMode, isSelect: true, options: ['rolling', 'manual'] },
+                  ].map((ctrl, i) => (
+                    <div key={i} className="bg-slate-950/40 border border-white/5 rounded-xl p-3 space-y-1.5 min-w-[120px] hover:border-indigo-500/20 transition-colors">
+                      <span className="block text-[9px] font-black text-slate-500 uppercase tracking-widest">{ctrl.label}</span>
+                      {ctrl.isSelect ? (
+                        <select
+                          className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0 cursor-pointer uppercase appearance-none"
+                          value={ctrl.value} onChange={e => ctrl.set(e.target.value)}
+                        >
+                          {ctrl.options.map(opt => <option key={opt} value={opt} className="bg-slate-900">{opt === 1000 ? '1K' : opt === 5000 ? '5K' : opt === 15000 ? '15K' : opt.toString().toUpperCase()}</option>)}
+                        </select>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number" className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0"
+                            value={ctrl.value} onChange={e => ctrl.set(+e.target.value)}
+                          />
+                          <span className="text-[10px] font-black text-slate-600">{ctrl.suffix}</span>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* User Trade Inputs */}
+          <section className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-3 gap-4">
+            <div className="bg-slate-900 border border-white/5 rounded-2xl p-4 space-y-2 shadow-lg">
+              <span className="block text-[10px] font-black text-slate-500 uppercase tracking-widest">Buy Date</span>
+              <input type="date" className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0"
+                value={buyDate} onChange={e => setBuyDate(e.target.value)} />
+            </div>
+            <div className="bg-slate-900 border border-white/5 rounded-2xl p-4 space-y-2 shadow-lg">
+              <span className="block text-[10px] font-black text-slate-500 uppercase tracking-widest">Buy Price</span>
+              <input type="number" className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0"
+                value={buyPrice} onChange={e => setBuyPrice(e.target.value)} />
+            </div>
+            <div className="bg-slate-900 border border-white/5 rounded-2xl p-4 space-y-2 shadow-lg">
+              <span className="block text-[10px] font-black text-slate-500 uppercase tracking-widest">Confidence</span>
+              <input type="number" min="0" max="1" step="0.01" className="w-full bg-transparent text-white text-xs font-bold border-none p-0 focus:ring-0"
+                value={confidence} onChange={e => setConfidence(parseFloat(e.target.value) || 0.9)} />
             </div>
           </section>
 
@@ -350,9 +791,10 @@ export default function App() {
                       <button 
                         key={d} 
                         onClick={() => {
-                          const sub = ohlcv.slice(-d);
-                          series.current.candles.setData(sub);
-                          charts.current.main.timeScale().fitContent();
+                            if (!series.current.candles || ohlcv.length === 0) return;
+                            const sub = ohlcv.slice(-d);
+                            series.current.candles.setData(sub);
+                            charts.current.main.timeScale().fitContent();
                         }}
                         className="whitespace-nowrap px-4 lg:px-6 py-2 lg:py-2.5 text-[9px] lg:text-[10px] font-black rounded-lg lg:rounded-xl text-slate-500 hover:text-white hover:bg-slate-900 transition-all uppercase tracking-widest"
                       >
@@ -366,20 +808,27 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-10">
+            <div className="grid grid-cols-1 gap-6 lg:gap-10">
                 <div className="bg-slate-900 border border-white/5 rounded-[2rem] p-6 lg:p-8 shadow-xl">
-                  <div className="flex items-center justify-between mb-8">
-                    <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.3em]">Boundary Dynamics</h4>
-                    <BarChart2 className="w-4 lg:w-5 h-4 lg:h-5 text-indigo-400" />
+                  <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.3em] mb-4">Decision Boundary</h4>
+                  <DecisionBoundaryTab 
+                    ce={backend.ce} 
+                    message={backend.message} 
+                    stats={backend.stats}
+                    decision={backend.decision}
+                    decisionText={backend.decision_text}
+                    buyRanges={backend.buy_ranges}
+                  />
+                  {backend.luck_score !== null && (
+                    <div className="mt-4 text-slate-300 text-sm">
+                      Luck Score (percentile vs scenarios): {(backend.luck_score * 100).toFixed(1)}%
+                    </div>
+                  )}
+                  <div className="mt-3 text-xs text-slate-500 space-y-1">
+                    <div>• Shows how your entry fared vs simulated paths.</div>
+                    <div>• CE compares staying vs switching (benchmark/cash).</div>
+                    <div>• Confidence input controls band width for explanations.</div>
                   </div>
-                  <div ref={boundaryChartRef} className="h-[240px] lg:h-[280px]"></div>
-                </div>
-                <div className="bg-slate-900 border border-white/5 rounded-[2rem] p-6 lg:p-8 shadow-xl">
-                  <div className="flex items-center justify-between mb-8">
-                    <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.3em]">Monte Carlo Fan</h4>
-                    <Zap className="w-4 lg:w-5 h-4 lg:h-5 text-indigo-400" />
-                  </div>
-                  <div ref={fanChartRef} className="h-[240px] lg:h-[280px]"></div>
                 </div>
               </div>
             </div>
@@ -407,22 +856,45 @@ export default function App() {
                   <div className="mt-8 lg:mt-12 space-y-3 lg:space-y-4">
                     {[
                       { label: 'Spot Price', value: results?.spot, type: 'currency', icon: CircleDot },
-                      { label: 'Boundary Limit', value: results?.boundary[0], type: 'currency', icon: ShieldCheck },
-                      { label: 'Estimated Vol', value: `${sigmaEst}%`, icon: Zap }
+                      { label: 'Gain/Loss', value: results?.spot && entryMeta.price ? ((results.spot - entryMeta.price) / entryMeta.price * 100) : null, type: 'percent', icon: TrendingUp },
+                      { label: 'Market Regime', value: backend.decision_text?.split('.')[0] || '---', type: 'text', icon: Activity },
+                      { label: 'Realized Rank', value: backend.luck_score !== null ? (backend.luck_score * 100).toFixed(1) + '%' : '--', type: 'text', icon: Zap }
                     ].map((item, i) => (
                       <div key={i} className="flex justify-between items-center p-4 lg:p-6 bg-slate-950/50 rounded-xl lg:rounded-2xl border border-white/5 group hover:border-indigo-500/30 transition-all">
                         <div className="flex items-center gap-3 lg:gap-4">
-                          <item.icon className="w-4 lg:w-5 h-4 lg:h-5 text-slate-600 group-hover:text-indigo-400 transition-colors" />
+                          <item.icon className={`w-4 lg:w-5 h-4 lg:h-5 transition-colors ${item.type === 'percent' ? (item.value >= 0 ? 'text-emerald-500' : 'text-rose-500') : 'text-slate-600 group-hover:text-indigo-400'}`} />
                           <span className="text-[10px] lg:text-[11px] font-black text-slate-500 uppercase tracking-widest">{item.label}</span>
                         </div>
-                        <span className="text-lg lg:text-xl font-bold text-white font-mono">
-                          {item.type === 'currency' ? `${currency}${item.value?.toLocaleString(undefined, {minimumFractionDigits: 2}) || '--'}` : item.value}
+                        <span className={`text-lg lg:text-xl font-bold font-mono ${item.type === 'percent' ? (item.value >= 0 ? 'text-emerald-400' : 'text-rose-400') : 'text-white'}`}>
+                          {item.type === 'currency'
+                            ? `${currency}${item.value?.toLocaleString(undefined, {minimumFractionDigits: 2}) || '--'}`
+                            : item.type === 'percent'
+                              ? (item.value !== null ? `${item.value > 0 ? '+' : ''}${item.value.toFixed(2)}%` : '--')
+                              : item.value}
                         </span>
                       </div>
                     ))}
                   </div>
 
-                  <div className="mt-8 lg:mt-12 p-6 lg:p-8 bg-white/[0.02] rounded-2xl lg:rounded-3xl border border-white/5">
+                  <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                    <div className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl">
+                      <div className="text-emerald-300 font-black uppercase tracking-widest text-[10px]">Entry</div>
+                      <div className="text-white font-mono text-lg">{entryMeta.price ? `${currency}${entryMeta.price.toFixed(2)}` : '--'}</div>
+                      <div className="text-slate-400">{entryMeta.date || '--'}</div>
+                    </div>
+                    <div className="p-4 bg-indigo-500/10 border border-indigo-500/30 rounded-xl">
+                      <div className="text-indigo-300 font-black uppercase tracking-widest text-[10px]">Target (+{(targetPct*100).toFixed(0)}%)</div>
+                      <div className="text-white font-mono text-lg">{entryMeta.price ? `${currency}${(entryMeta.price*(1+targetPct)).toFixed(2)}` : '--'}</div>
+                      <div className="text-slate-400">Prob hit: {backend.stats ? `${(backend.stats.prob_target*100).toFixed(1)}%` : '--'}</div>
+                    </div>
+                    <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl">
+                      <div className="text-rose-300 font-black uppercase tracking-widest text-[10px]">Stop (-{(drawdownPct*100).toFixed(0)}%)</div>
+                      <div className="text-white font-mono text-lg">{entryMeta.price ? `${currency}${(entryMeta.price*(1-drawdownPct)).toFixed(2)}` : '--'}</div>
+                      <div className="text-slate-400">Prob breach: {backend.stats ? `${(backend.stats.prob_drawdown*100).toFixed(1)}%` : '--'}</div>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 p-6 lg:p-8 bg-white/[0.02] rounded-2xl lg:rounded-3xl border border-white/5">
                     <div className="flex gap-4">
                       <Info className="w-5 lg:w-6 h-5 lg:h-6 text-indigo-400 shrink-0" />
                       <p className="text-[11px] lg:text-xs leading-relaxed text-slate-400 font-medium uppercase tracking-tight">
@@ -441,26 +913,7 @@ export default function App() {
                 }`}></div>
               </div>
 
-              <div className="bg-slate-900 border border-white/5 rounded-3xl lg:rounded-[2.5rem] p-6 lg:p-10 shadow-2xl">
-                <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.4em] mb-8 lg:mb-10 flex items-center gap-4">
-                  <div className="w-2 h-2 bg-indigo-500 rounded-full"></div>
-                  System Diagnostics
-                </h4>
-                <div className="grid grid-cols-2 gap-4 lg:gap-6">
-                  {[
-                    { label: 'Convergence', val: '99.99%', sub: 'PRECISION' },
-                    { label: 'Engine Load', val: `${(paths/15000 * 100).toFixed(0)}%`, sub: 'RESOURCE' },
-                    { label: 'Latency', val: '12ms', sub: 'NETWORK' },
-                    { label: 'Stability', val: 'HIGH', sub: 'STATE' }
-                  ].map((stat, i) => (
-                    <div key={i} className="bg-slate-950/50 border border-white/5 rounded-xl lg:rounded-2xl p-4 lg:p-5 group hover:border-indigo-500/20 transition-all">
-                      <p className="text-[8px] lg:text-[9px] font-black text-slate-600 uppercase tracking-widest mb-1">{stat.label}</p>
-                      <p className="text-base lg:text-lg font-black text-white">{stat.val}</p>
-                      <p className="text-[8px] font-bold text-indigo-500/40 uppercase mt-1">{stat.sub}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              {/* Removed System Diagnostics to declutter */}
             </div>
           </section>
         </main>

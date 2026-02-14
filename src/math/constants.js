@@ -1,0 +1,14 @@
+export const TRADING_DAYS = 252;
+export const DEFAULT_HORIZON_DAYS = 22;
+export const DEFAULT_RISK_FREE_PCT = 6.5;
+export const DEFAULT_YIELD_PCT = 0.0;
+export const DEFAULT_VOL_MODE = 'rolling';
+export const DEFAULT_VOL_WINDOW = 126;
+export const DEFAULT_MANUAL_VOL_PCT = 30;
+export const DEFAULT_PATHS = 5000;
+export const DEFAULT_SEED = 42;
+export const DEFAULT_COST_BPS = 10;
+export const DEFAULT_OBJECTIVE = 'max_ev';
+export const DEFAULT_LAMBDA = 0;
+export const DEFAULT_BASIS_DEGREE = 2;
+export const FAN_QUANTILES = [0.1, 0.5, 0.9];
